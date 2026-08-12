@@ -1,6 +1,9 @@
 services:
   postgres:
-    image: postgres:15-alpine
+    build:
+      context: .
+      dockerfile: docker/postgres/Dockerfile
+    image: themis-postgres-pgvector:15
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-themis}
       POSTGRES_USER: ${POSTGRES_USER:-themis}

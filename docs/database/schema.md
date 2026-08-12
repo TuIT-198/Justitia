@@ -58,10 +58,417 @@ Seeds include durian and the forms `FRESH`, `FROZEN_WHOLE`, `FROZEN_PULP`, and `
 
 HS code uniqueness is scoped to a nomenclature. Product mapping supports optional product form, market, and validity dates. No HS code is seeded because no official classification source was supplied and verified for this phase.
 
+### Export batches
+
+- `export_batches` — tenant root, unique by organization and batch code
+- `export_batch_items` — tenant child linked through `(organization_id, batch_id)`
+
+Batch lifecycle is independent from any future compliance result. Supported lifecycle states are `DRAFT`, `PREPARING`, `READY_FOR_CHECK`, `UNDER_REVIEW`, `ACTION_REQUIRED`, `READY_FOR_EXPORT`, `EXPORTED`, and `CANCELLED`.
+
+Batch items enforce product consistency with composite foreign keys for both variety and form. Variety and HS code are nullable so incomplete drafts are valid. The database only verifies that a referenced HS record exists. Selecting the applicable mapping from product, form, market, and effective date remains domain logic; a `product_hs_codes` row must not be interpreted as legally authoritative without verified provenance.
+
+### Registered export entities
+
+- `registered_export_entities` — global registry identity master
+- `organization_registered_entities` — tenant-owned, historical organization/entity relationships
+- `batch_registered_entities` — tenant child linked to a batch through a composite tenant FK
+
+`GROWING_AREA` represents a PUC-like identity and `PACKING_FACILITY` represents a PHC-like identity. Processing and storage facilities are also supported. `registry_namespace` identifies the normalized registry or internal namespace; it does not hard-code or imply approval from a legal authority. Namespace and registry code use case-insensitive `citext` and are unique as a pair. No registry entities or market approvals are seeded.
+
+### Documents, immutable revisions, and files
+
+- `document_types` is a global configuration catalog.
+- `documents` is the stable tenant-owned business identity. It contains business descriptors but no file path or OCR output.
+- `document_revisions` is a versioned content state. Revision numbers are unique per tenant/document, and `previous_revision_id` is constrained to the same tenant and document.
+- `document_files` contains private object metadata and belongs to a revision, never directly to a document.
+- `batch_documents` attaches a document identity to a batch. A future Compliance Check will snapshot a specific verified revision.
+
+The distinction is intentional: a document answers “which business evidence is this?”, a revision answers “which version of its contents?”, and a file answers “which immutable private objects compose that revision?”.
+
+Revision status supports `DRAFT`, `READY_FOR_REVIEW`, `VERIFIED`, `REJECTED`, and `SUPERSEDED`. Database triggers protect `VERIFIED` and `SUPERSEDED` revisions from content mutation or deletion and protect their file membership from insert, update, or delete. The only allowed status transition from a verified revision is `VERIFIED → SUPERSEDED`. Corrections create a new revision linked through `previous_revision_id`.
+
+### Revision versus replacement
+
+- Use a new revision when corrected content is still the same business document identity.
+- Create a new `documents` row with tenant-safe `supersedes_document_id` when an authority issues a new business document, such as a certificate with a new number or issue date.
+
+Neither approach overwrites prior evidence.
+
+### Private storage model
+
+`document_files.storage_path` is a private object key, not a URL. HTTP(S) paths are rejected, original evidence requires a 64-character SHA-256 checksum, and no secret or signed URL is persisted. Supabase Storage with a private bucket is the preferred conceptual provider, but no SDK dependency is added before a backend exists.
+
+Access flow:
+
+```text
+authorized backend
+  → verifies tenant permission for document/revision/file
+  → generates a short-lived signed URL for the exact object
+  → client accesses the private file
+```
+
+The frontend must not receive a service-role key or generate arbitrary signed URLs.
+
+### OCR extraction and human verification
+
+- `document_extraction_jobs` belongs to an exact revision/file pair. Composite FKs prove the file belongs to that revision and tenant. Tenant-scoped idempotency keys and retry counters support future workers.
+- `extracted_fields` preserves `raw_value` independently from `normalized_value`; normalization never overwrites OCR evidence.
+- `document_verifications` represents human review of a revision and optional extraction job.
+- `document_verification_changes` is append-only correction history with old/new values. Field/lab targets are validated to the same tenant and revision as the verification.
+
+The data layers are deliberately distinct:
+
+```text
+raw OCR/provider output
+  → immutable source evidence and extracted raw values
+normalized structured data
+  → parsed codes, dates, numbers, and normalized lab measurements
+human verification
+  → reviewer decision plus append-only correction history
+```
+
+No OCR provider SDK is installed. A future worker may use `OCR`, `VISION_LLM`, `PARSER`, or `MANUAL` extraction methods and must preserve provider output rather than replacing it with corrected values.
+
+Verification and revision status are not synchronized by a database trigger. A future service must perform one transaction in this order: update the verification to `VERIFIED` with reviewer/timestamp, then update the revision to `VERIFIED` with its timestamp. If either statement fails, the transaction rolls back. This keeps the workflow explicit and avoids trigger interaction with Phase 03 immutability.
+
+### Measurement dimensions and units
+
+- `measurement_dimensions` defines `MASS_FRACTION`, `MASS`, `TEMPERATURE`, and `TIME`.
+- `measurement_units` stores a positive conversion factor and offset for conversion to the dimension's canonical unit.
+- A partial unique index permits at most one active canonical unit per dimension. The dimension points to that active canonical unit, and triggers prevent the referenced unit from becoming inactive or non-canonical.
+
+Normalization is application-calculated using:
+
+```text
+normalized_value = raw_value * conversion_factor + conversion_offset
+```
+
+The database does not calculate conversions automatically. It enforces that raw and normalized units belong to the same dimension and that `normalized_unit_id` is active and canonical. Seeded canonical units are `mg/kg`, `kg`, `°C`, and `second`. Seed data also includes `ppm`, `µg/kg`, `g`, `K`, `minute`, and `hour`. These are physical reference conversions, not legal limits.
+
+### Lab result semantics
+
+`lab_test_results` retains the raw analyte name until a later Legal phase supplies a regulated-substance catalog. Supported qualifiers preserve laboratory meaning:
+
+| Qualifier | Meaning |
+|---|---|
+| `EXACT` | Numeric result; `result_value` is required. |
+| `LESS_THAN` | Numeric reporting threshold; the actual value is not assumed equal to the threshold. |
+| `LESS_THAN_LOD` | Below detection limit; `detection_limit` is required. |
+| `LESS_THAN_LOQ` | Below quantification limit; `quantification_limit` is required. |
+| `NOT_DETECTED` | No numeric result is required and the value is never coerced to zero. |
+| `DETECTED_NOT_QUANTIFIED` | Detected, but no defensible quantified value. |
+| `TEXT_ONLY` | Non-numeric reported result; `result_text` is required. |
+
+LOD and LOQ cannot be negative. Compound lab conventions, uncertainty models, method-specific reporting rules, and substance mapping remain unsupported until later phases.
+
+### Verified structured evidence
+
+Before revision verification, extraction jobs, fields, lab results, and verification records can participate in the review workflow. Once the parent revision becomes `VERIFIED` or `SUPERSEDED`, PostgreSQL triggers block inserts, updates, and deletes across those records. Raw extraction evidence therefore remains reproducible. Verification correction records are append-only even before final verification. Any later correction requires a new document revision and a separate extraction/verification cycle.
+
+### Official legal provenance
+
+Legal knowledge is shared reference data and intentionally has no `organization_id`. The mandatory production provenance chain is:
+
+```text
+legal limit / structured requirement
+  → legal requirement
+  → exact legal section
+  → immutable legal document version
+  → legal document
+  → official source
+```
+
+`legal_sources` records origin and official/trust classification; `legal_authorities` represents regulatory bodies separately from tenant organizations. A legal document is stable identity and bibliographic metadata. `legal_document_versions` is the exact content/effective snapshot, while `legal_document_files` anchors it to a private original file and SHA-256 checksum. Legal content is never stored as a replacement blob on `legal_documents`.
+
+No legal source, authority, substance, requirement, limit, citation, or market approval is seeded. Test fixtures use clearly marked fictitious data inside rolled-back transactions only.
+
+### Legal section hierarchy and citations
+
+`legal_sections` preserves Part/Chapter/Section/Article/Clause/Point/Annex structure. Composite self-FKs prevent cross-version parents. RAG chunking is not implemented and will remain a derived retrieval artifact rather than legal provenance.
+
+Every `legal_citations` row requires both `version_id` and `section_id`, enforced as the same version/section pair. Optional requirement citations use a composite FK that requires the requirement to belong to that exact section. Citation codes are unique within a version. The explicit `version_id` is a relational consistency key enabling exact approval provenance; it is not an independent source of truth.
+
+### Requirements, scopes, and parameters
+
+- `legal_requirements` turns a section's legal meaning into structured obligation metadata. Requirement codes are globally unique so logs and later rules can identify them without version context ambiguity.
+- `requirement_scopes` describes where a requirement applies.
+- `requirement_parameters` contains structured operands and measurement-unit references; free-form unit strings are not used.
+
+Scope semantics are fixed:
+
+- Within one scope row, every populated dimension is combined with **AND**.
+- `NULL` means wildcard: all values for that dimension.
+- Multiple scope rows for one requirement are combined with **OR**.
+
+If both product and form are populated, a composite FK proves the form belongs to that product. HS existence is enforced, but applicability to a product/form/market is deliberately left to later resolution logic rather than inferred from unverified mappings.
+
+Future deterministic resolution orders matches by: effective date, explicit priority, specificity, then applicable legal version. Specificity is computed as the count of matching non-NULL dimensions and is not stored. If candidates remain tied or overlapping after these rules, the Compliance phase must return `AMBIGUOUS_RULE`; it must not guess.
+
+Exact-scope temporal exclusion is not implemented because nullable multi-dimensional UUID scope keys would require sentinel/coalescing machinery that is difficult to maintain. Date constraints and indexes are present; overlap detection is an explicit future query/service responsibility.
+
+### Legal limits versus lab results
+
+`legal_limits` is a normative legal threshold and must reference a requirement, which guarantees the full provenance chain. It stores raw and canonical normalized numeric values using measurement-unit FKs. Units must share a dimension and the normalized unit must be active/canonical. Limits and effective dates cannot be negative/reversed under the current MRL/contaminant policy.
+
+`lab_test_results` is observed evidence from a tenant document. It retains raw and normalized analyte names and now has an optional `regulated_substance_id`. Mapping is an explicit reviewed association; no AI matching occurs. A lab result and legal limit are never the same record and are not compared in this phase.
+
+### Market entity approval provenance
+
+`market_entity_approvals` links a registered facility to a market and authority under an exact legal version and citation. Its composite FK `(source_version_id, legal_citation_id)` makes it impossible to pair version A with a citation from version B. Citations themselves resolve to exact sections. No real PUC/PHC or market approval is seeded.
+
+### Legal immutability
+
+Once a version reaches `APPROVED`, `ACTIVE`, `SUPERSEDED`, `EXPIRED`, or `REPEALED`, its content/provenance fields and structured children are immutable. Protected children include official files, sections, requirements, scopes, parameters, limits, and citations. Original legal files are append-only even during review.
+
+Allowed protected lifecycle transitions are `APPROVED → ACTIVE` and `ACTIVE → SUPERSEDED | EXPIRED | REPEALED`. A real correction creates a new legal document version and new structured records; old meaning is never rewritten.
+
+### Compliance rules and executable versions
+
+`compliance_rules` is stable rule identity and always references a structured legal requirement. `compliance_rule_versions` contains executable configuration and references the exact legal document version that contains that requirement. A provenance trigger rejects a rule/legal-version mismatch and only permits activation when both requirement and legal version are approved/active.
+
+`condition_config` contains selectors/operators/references needed to execute a rule; it must not duplicate legal limits or other structured legal truth. Active and superseded executable versions are immutable. Corrections create another numbered rule version.
+
+No production rule or version is seeded.
+
+### Compliance check versus re-check
+
+`compliance_checks` is tenant-owned and references an exact batch and market. Process `status` (`QUEUED`, `PROCESSING`, `COMPLETED`, `FAILED`, `CANCELLED`) is distinct from business `overall_result` (`COMPLIANT`, `ACTION_REQUIRED`, `NON_COMPLIANT`, `MANUAL_REVIEW_REQUIRED`). A completed check must carry an overall result; other process states do not.
+
+A re-check is a new row with a higher batch-scoped `check_number` and tenant/batch-safe `parent_check_id`. It never rewrites its parent. Idempotency keys are unique per tenant.
+
+### Immutable document and legal snapshots
+
+`compliance_check_documents` freezes the exact document identity, verified revision, file, optional extraction job, verification, and both revision/file checksums. Composite FKs prove all records share the tenant and exact revision/file relationship. Insert validation additionally requires:
+
+- the document is attached to the checked batch;
+- revision and verification are verified;
+- verification and optional extraction job match;
+- snapshot checksums equal immutable evidence.
+
+Relational references are sufficient because verified source evidence is already immutable; OCR/lab JSON is not duplicated.
+
+`compliance_check_legal_versions` freezes each approved/active legal snapshot. Later legal versions never replace a historical check's snapshot. A future service must resolve all applicable evidence/law in one transaction before completion.
+
+### Rule execution versus finding
+
+`rule_executions` stores every applicable execution—including PASS—for reproducibility. It retains raw/normalized actual and expected values with unit IDs. PostgreSQL rejects cross-dimension or non-canonical normalized units. Numeric comparison uses canonical values, never unit strings.
+
+Qualifier policy remains conservative:
+
+- `EXACT` supports a deterministic numeric comparison.
+- `LESS_THAN`, `LESS_THAN_LOD`, and `LESS_THAN_LOQ` preserve threshold semantics and may be decidable only when the legal operator supports a safe conclusion.
+- `NOT_DETECTED` is never converted to zero.
+- `DETECTED_NOT_QUANTIFIED` or any uncertain qualifier yields `REVIEW_REQUIRED` rather than a guessed PASS.
+
+A PASS normally creates no finding. FAIL and REVIEW_REQUIRED executions may create findings. `findings` is the user-facing issue layer, while executions remain the complete audit of evaluated rules.
+
+### Scope and deterministic registry resolution
+
+Rule resolution reuses Phase 05 semantics: AND inside a scope row, NULL wildcard, OR across rows. Candidate ordering is effective date, explicit priority, specificity, then legal-version applicability. Inactive/out-of-date versions are excluded. Equal winning candidates produce `AMBIGUOUS_RULE` and a `REVIEW_REQUIRED` execution; UUID order is never a legal tie-breaker.
+
+Registry matching follows:
+
+```text
+batch
+  → assigned registered entity and role
+  → market entity approval
+  → approval status and validity date
+  → exact citation/version provenance
+```
+
+An active approval during the check date can support PASS. Missing, expired, conflicting, or provenance-incomplete data produces FAIL or REVIEW_REQUIRED according to the rule configuration; AI is never consulted.
+
+### Finding citations
+
+`RULE_ENGINE` findings require a same-check rule execution; `MANUAL` findings prohibit one. A deferred constraint requires every `VALIDATED` finding to have at least one `finding_citations` row by transaction end. Citation insertion also verifies its legal version is in the check snapshot. This conservative foundation treats all validated findings as legal conclusions requiring citation.
+
+Create a validated finding and its citation in one transaction. Review-required or rejected findings may exist without a citation while review is unresolved.
+
+### Overall result baseline
+
+The database function `derive_compliance_overall_result(check_id)` provides a conservative deterministic baseline:
+
+1. Any execution error, `REVIEW_REQUIRED`, or unresolved manual-review finding → `MANUAL_REVIEW_REQUIRED`.
+2. Any validated `HIGH`/`CRITICAL` finding → `NON_COMPLIANT`.
+3. Any FAIL or validated `LOW`/`MEDIUM` finding → `ACTION_REQUIRED`.
+4. At least one execution, all completed as PASS/SKIPPED, and no issue above → `COMPLIANT`.
+5. Anything incomplete/unclear → `MANUAL_REVIEW_REQUIRED`.
+
+The completion trigger requires document/legal snapshots and executions, and rejects an overall result that differs from this function. Severity is a conservative workflow baseline, not invented legal meaning; later business policy may version/refine aggregation rather than rewriting historical checks.
+
+### Completed-check immutability and events
+
+Once `COMPLETED`, the check, document/legal snapshots, executions, findings, and finding citations cannot be inserted, updated, or deleted. Reassessment creates a re-check. `compliance_check_events` is append-only and may record a genuine post-completion event without changing the completed conclusion.
+
+Production preconditions that span full domain completeness—such as confirming every applicable rule was resolved—remain service transaction responsibilities. Database constraints enforce reference/status safety where practical without a domain-scanning trigger.
+
+### Snapshot-filtered RAG and AI citation integrity
+
+- `legal_chunks` stores exact non-empty spans of `legal_sections.content`, preserving section boundaries and a unique section-local chunk index. Chunks are retrieval artifacts, not final citations.
+- `legal_embeddings` uses pgvector `vector` without a global dimension typmod. A trigger verifies the stored per-model dimension, non-zero vector, and exact chunk content hash. `(chunk_id, embedding_model)` is unique.
+- `retrieve_legal_chunks_for_check` joins through the tenant/check and `compliance_check_legal_versions` before cosine scoring. It returns chunk/section/version/content/citation IDs/score and excludes all non-snapshotted legal versions.
+- `ai_runs` is tenant-owned, retry/idempotency-aware, and retains provider/model/prompt/input/response/validation/error evidence. Terminal rows are immutable.
+- `findings.ai_run_id` is a tenant/check-safe composite FK. AI requires a completed AI run and prohibits a rule execution; rule-engine and manual reference combinations remain exact.
+- Strict application validation rejects unknown fields and AI-authored overall results. Citation IDs must be in both the supplied context and the relational check snapshot. Empty or invalid citations cannot produce a validated finding.
+
+### Compliance report snapshots and approval rounds
+
+- `compliance_reports` is tenant-owned and has a strict `0..1` relationship with a compliance check. Its batch and overall result must exactly match a completed check.
+- Root reports are version 1 without a parent. A re-check report must reference the approved report of its parent check and increment the batch-scoped version by one.
+- `generate_compliance_report` atomically creates the draft header, snapshots every finding, and snapshots every source finding citation. It fails on incomplete validated-finding legal basis.
+- `report_findings` retains display content independently from source findings. The FK remains for provenance, but historical rendering uses snapshot columns.
+- `report_finding_citations` retains citation text, exact legal document/version/section/requirement, legal-version content hash, and an original legal-file checksum only when unambiguous. Free-text citations without a source `legal_citations` row are impossible.
+- Submission increments `submission_round`. `report_approvals` is append-only, and one OWNER/MANAGER decision finalizes the current round. Rejection can return to draft and resubmit without overwriting prior decisions.
+- Once approved, report headers, finding snapshots, citation snapshots, and approval history reject update/delete operations.
+
+### Remediation evidence and re-check lineage
+
+- `remediation_tasks` belongs to an approved report, its batch, and one finding snapshotted by that report. All MVP tasks are required and must be approved before re-check.
+- `remediation_task_assignees` supports multiple assignees and validates active organization membership at assignment time.
+- `remediation_evidence` references an exact same-tenant document, `VERIFIED` revision, and matching `VERIFIED` verification. Evidence provenance cannot be rewritten or deleted after submission.
+- Evidence review moves the task into review; `remediation_reviews` is append-only and requires the dedicated OWNER/MANAGER permission. A task can become approved only with accepted verified evidence and an approved review.
+- `remediation_task_events` is append-only and records task, evidence, review, assignment, and re-check milestones.
+- `create_recheck_for_report` creates a new same-batch `QUEUED` check with `parent_check_id`, next check number, and required idempotency key. It does not copy snapshots or invoke compliance/AI engines.
+- If an approved report has no remediation tasks, an authorized OWNER/MANAGER may explicitly create a re-check. Otherwise every task must be approved with accepted evidence.
+- A later completed re-check generates a new report with `parent_report_id`; old checks and reports remain unchanged.
+
+## Tenant boundaries
+
+| Table | Classification | Enforcement |
+|---|---|---|
+| `export_batches` | Tenant root | `UNIQUE (organization_id, id)` |
+| `export_batch_items` | Tenant child | Composite FK to its batch |
+| `organization_registered_entities` | Tenant relationship root | Direct organization FK and `UNIQUE (organization_id, id)` |
+| `batch_registered_entities` | Tenant child | Composite FK to its batch |
+| `documents` | Tenant root | `UNIQUE (organization_id, id)` and tenant-safe replacement self-FK |
+| `document_revisions` | Tenant child/version root | Composite document FK and tenant/document-safe lineage FK |
+| `document_files` | Tenant child | Composite FK to its revision |
+| `batch_documents` | Tenant join child | Composite FKs to both batch and document |
+| `document_extraction_jobs` | Tenant child | Composite FKs to revision and the exact file/revision pair |
+| `extracted_fields` | Tenant child | Composite FK to extraction job |
+| `lab_test_results` | Tenant child | Composite revision FK and optional same-revision extraction FK |
+| `document_verifications` | Tenant child | Composite revision FK and optional same-revision extraction FK |
+| `document_verification_changes` | Tenant child/history | Composite verification FK plus validated target |
+| `ai_runs` | Tenant child/audit root | Composite FK to check plus tenant idempotency and `UNIQUE (organization_id, check_id, id)` |
+| AI `findings` | Tenant child | Composite FK to the exact organization/check AI run |
+| `compliance_reports` | Tenant check snapshot root | Composite FKs to batch/check/parent report plus tenant check/version uniqueness |
+| `report_findings` | Tenant report snapshot | Composite FKs to exact report/check and source finding |
+| `report_finding_citations` | Tenant report snapshot | Composite FK to report finding plus exact global legal provenance |
+| `report_approvals` | Tenant append-only history | Composite report/member FKs and round/reviewer uniqueness |
+| `remediation_tasks` | Tenant workflow root | Composite FKs to approved report/batch and its snapshotted finding |
+| `remediation_task_assignees` | Tenant task child | Composite task and organization-member FKs |
+| `remediation_evidence` | Tenant immutable evidence | Composite task/document/revision/verification/member FKs |
+| `remediation_reviews` | Tenant append-only history | Composite task and reviewer membership FKs |
+| `remediation_task_events` | Tenant append-only timeline | Composite task and optional actor membership FKs |
+| `batch_legal_impacts` | Tenant monitoring result | Composite batch and optional same-batch check FKs plus organization/batch/item uniqueness |
+| `alerts` | Tenant persistent event | Composite batch/impact linkage and immutable business-event fields |
+| `alert_recipients` | Tenant alert child | Composite alert and active permitted member validation |
+| `notifications` | Tenant delivery history | Composite alert/member FKs and tenant-scoped idempotency |
+| `audit_logs` | Tenant-aware/global append-only event | Nullable organization provenance; tenant rows exposed only through membership RLS |
+| `audit_log_changes` | Append-only event detail | Parent audit resolution policy prevents tenant leakage |
+| `data_access_logs` | Tenant sensitive-access history | Composite organization/member FK and approved insert function |
+| `system_job_runs` | Tenant/global worker history | Tenant RLS for app, explicit worker policy, split tenant/global idempotency indexes |
+
+RLS remains deferred, but these keys prevent an organization identifier from being substituted to link a child to another tenant's batch.
+
+## Phase 02 index decisions
+
+- Batch list filters use `(organization_id, status)` and `(organization_id, planned_export_date)`.
+- Batch-item lookup uses `(organization_id, batch_id)`.
+- Registry lookup by namespace/code reuses the unique index; no duplicate index is added.
+- Registry discovery uses `(country_id, entity_type)`.
+- Organization/entity lookup uses `(organization_id, registered_entity_id)`.
+- Batch/entity lookup by batch reuses the exact-link unique index prefix; reverse lookup has a separate `registered_entity_id` index.
+
+## Phase 03 index decisions
+
+- Document queries use organization plus type, document number, or status.
+- Revision ordering reuses the unique `(organization_id, document_id, revision_number)` index; status queues use `(organization_id, status)`.
+- File lookup uses `(organization_id, document_revision_id)`.
+- Batch attachment lookup by batch reuses the exact-attachment unique index prefix; reverse lookup uses `(organization_id, document_id)`.
+
+## Phase 04 index decisions
+
+- Extraction queues use organization plus revision or status; idempotency uses a tenant-scoped partial unique index.
+- Extracted field lookup uses organization plus job or extensible field code.
+- Lab lookup uses organization plus revision or normalized analyte name.
+- Verification queues use organization plus revision or status; correction history uses organization plus verification.
+- Existing composite unique indexes are reused where their leading columns already satisfy a required lookup.
+
+## Phase 05 index decisions
+
+- Legal documents/versions are indexed by source/type, document/status, and effective dates.
+- Section hierarchy is indexed by version/order and version/parent.
+- Requirements are indexed by section/status and requirement/validation type.
+- Scope indexes support requirement, product/form/market, and HS resolution.
+- Legal limits support provenance, substance/product/market, and effective-date queries.
+- Citation and market-approval indexes support provenance and registry/market status lookups.
+- Existing unique indexes cover globally unique requirement/substance codes and version-scoped citation codes without duplicates.
+
+## Phase 06 index decisions
+
+- Checks support batch history, process queues, and overall-result filters.
+- Snapshot, execution, and finding lookups reuse composite unique/primary indexes where their leading columns already cover check access.
+- Rule versions have unique rule/version indexing plus active/effective filtering.
+- Execution indexes support rule-version and outcome analysis; finding indexes support severity/validation queues.
+- Event timelines use `(organization_id, check_id, created_at)`.
+
+## Phase 07 index decisions
+
+- Chunk lookup uses `section_id`; exact `(section_id, chunk_index)` uniqueness already supplies ordered section access.
+- Embedding lookup filters by `(embedding_model, embedding_dimension)` before exact cosine scoring. No ANN index is created until a production model/dimension and workload are verified.
+- AI run queues/history use organization plus status or check/created time; tenant idempotency uses a partial unique index.
+- AI finding lookup uses the same tenant/check/run composite as its FK and excludes NULL rows with a partial index.
+
+## Phase 08 index decisions
+
+- Latest-report queries use `(organization_id, batch_id, version_number DESC)`; report workflow queues use organization/status/time.
+- Report finding rendering uses report/display order; reverse citation provenance uses `source_citation_id`.
+- Approval history uses organization/report/submission round, complementing round/reviewer uniqueness.
+- Remediation queues use report or batch plus status. Evidence, review, and event histories use organization/task/time.
+- Existing composite unique indexes are reused for tenant-safe report/finding/task/evidence foreign keys.
+
+## Phase 09 legal monitoring and alerts
+
+- `regulation_changes` stores a same-document old/new version pair and requires direct newer-version lineage. `NEW` is the only type with a NULL old version.
+- `regulation_change_items` stores structured requirement or legal-limit provenance. Category-specific checks prevent empty or mismatched reference shapes.
+- `compare_legal_versions` fingerprints structured requirements, scopes, and limits. It records reviewable added/removed items in `ANALYZING`; manual confirmation is required.
+- `batch_legal_impacts` applies the established AND/NULL-wildcard/OR scope policy and conservative effective-date handling. Missing or ambiguous facts produce `REVIEW_REQUIRED`.
+- `alerts` stores persistent business events. Batch-risk alerts exist only for risky impacts and deduplicate by organization, impact, and type.
+- `alert_recipients` resolves active organization members through `ALERT_READ`; the seed maps OWNER, MANAGER, and COMPLIANCE.
+- `notifications` stores delivery attempts separately from alerts. Tenant idempotency, bounded retry counters, explicit lifecycle transitions, and terminal-history protection are enforced.
+- Monitoring never updates a batch lifecycle or formal compliance result. A new check/re-check remains mandatory for a compliance conclusion.
+
+## Phase 09 index decisions
+
+- Regulation-change queues use document/detected time or status/detected time; item lookup uses change/category.
+- Batch impact queues use change item/status or organization/status/assessment time.
+- A partial unique alert index prevents duplicate impact/type events without restricting non-impact alerts.
+- Alert inbox lookup uses organization/status/time and recipient user/read state.
+- Notification delivery uses organization/user/status/time; retry workers use pending/failed status plus `next_retry_at`.
+
+## Phase 10 audit, jobs, and RLS
+
+- `audit_logs` records tenant-aware or global events with category/action/result/source and request/network metadata. Entity references are intentionally polymorphic and are not foreign keys.
+- `audit_log_changes` stores small field-level deltas instead of whole-row before/after blobs.
+- `data_access_logs` records deliberate sensitive-resource VIEW/DOWNLOAD/EXPORT/PRINT access, not ordinary reads.
+- All three audit histories reject UPDATE and DELETE. Approved security-definer insert functions validate transaction context before writing.
+- `system_job_runs` stores tenant/global worker attempts, bounded retries, result counts, errors, timing, and metadata. Separate partial indexes deduplicate tenant and global idempotency keys.
+- Portable RLS is enabled on every tenant-owned table plus parent-derived finding citations and audit changes. Both `USING` and `WITH CHECK` enforce active membership.
+- Context helpers return NULL for missing/malformed UUID settings. Membership helpers have fixed search paths, explicit schema qualification, and revoked PUBLIC execution.
+- Logical roles separate normal application, worker, and explicit administrative paths. The application role has no ownership, DDL, trigger-disable, legal-write, or RLS-bypass privilege.
+
+## Phase 10 index decisions
+
+- Membership RLS uses both `(user_id, organization_id, status)` and `(organization_id, user_id, status)` indexes.
+- Audit review uses tenant/time, user/time, entity/time, and request indexes; field changes use parent/time.
+- Sensitive-access review uses tenant/time and resource/time.
+- Job workers use status/retry time and tenant/history indexes; tenant/global idempotency is split to handle NULL organization correctly.
+
 ## Seed strategy
 
 Reference seeds use natural codes as conflict targets and either update descriptive fields or ignore an existing relationship. Re-running the migration runner skips recorded migrations; executing the seed SQL itself again is also idempotent. Seed data is operational/reference data only and contains no MRL or legal conclusion.
 
 ## Deferred explicitly
 
-Export batches, facilities/PUC/PHC, documents, OCR, measurement units, legal knowledge, RAG, rule execution, AI, findings, reports, remediation, monitoring, alerts, dashboards, and RLS policies are outside Foundation Phase 01.
+Real legal ingestion/crawling, production legal/compliance/monitoring values, production embedding workers, live AI integration testing, full backend orchestration, external email/SIEM delivery, PDF report rendering/export, dashboards, frontend, Supabase migration, and production deployment remain deferred.

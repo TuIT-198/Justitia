@@ -22,24 +22,42 @@ try {
     & (Join-Path $PSScriptRoot "migrate.ps1") -Database $testDatabase
     & (Join-Path $PSScriptRoot "migrate.ps1") -Database $testDatabase
 
-    $seedSql = Get-Content -Raw -LiteralPath (Join-Path $projectRoot "db/migrations/007_seed_reference_data.sql")
-    $seedSql | docker compose --project-directory $projectRoot exec -T postgres psql `
-        --username $dbUser --dbname $testDatabase --set ON_ERROR_STOP=1
-    if ($LASTEXITCODE -ne 0) { throw "Reference seed rerun failed" }
+    Get-ChildItem -LiteralPath (Join-Path $projectRoot "db/migrations") -Filter "*seed*.sql" |
+        Sort-Object Name | ForEach-Object {
+            Write-Host "SEED  $($_.Name)"
+            $seedSql = Get-Content -Raw -LiteralPath $_.FullName
+            $seedSql | docker compose --project-directory $projectRoot exec -T postgres psql `
+                --username $dbUser --dbname $testDatabase --set ON_ERROR_STOP=1
+            if ($LASTEXITCODE -ne 0) { throw "Reference seed rerun failed: $($_.Name)" }
+        }
 
-    $testSql = Get-Content -Raw -LiteralPath (Join-Path $projectRoot "tests/database/foundation.sql")
-    $testSql | docker compose --project-directory $projectRoot exec -T postgres psql `
-        --username $dbUser --dbname $testDatabase --set ON_ERROR_STOP=1
-    if ($LASTEXITCODE -ne 0) { throw "Foundation assertions failed" }
+    Get-ChildItem -LiteralPath (Join-Path $projectRoot "tests/database") -Filter "*.sql" |
+        Sort-Object Name | ForEach-Object {
+            Write-Host "TEST  $($_.Name)"
+            $testSql = Get-Content -Raw -LiteralPath $_.FullName
+            $testSql | docker compose --project-directory $projectRoot exec -T postgres psql `
+                --username $dbUser --dbname $testDatabase --set ON_ERROR_STOP=1
+            if ($LASTEXITCODE -ne 0) { throw "Database assertions failed: $($_.Name)" }
+        }
+
+    Get-ChildItem -LiteralPath (Join-Path $projectRoot "tests/security") -Filter "*.sql" |
+        Sort-Object Name | ForEach-Object {
+            Write-Host "SECURITY  $($_.Name)"
+            $testSql = Get-Content -Raw -LiteralPath $_.FullName
+            $testSql | docker compose --project-directory $projectRoot exec -T postgres psql `
+                --username $dbUser --dbname $testDatabase --set ON_ERROR_STOP=1
+            if ($LASTEXITCODE -ne 0) { throw "Security/RLS assertions failed: $($_.Name)" }
+        }
 
     $migrationCount = docker compose --project-directory $projectRoot exec -T postgres psql `
         --username $dbUser --dbname $testDatabase --tuples-only --no-align `
         --command "SELECT count(*) FROM schema_migrations;"
-    if ($LASTEXITCODE -ne 0 -or $migrationCount.Trim() -ne "7") {
-        throw "Expected 7 applied migrations, got '$($migrationCount.Trim())'"
+    $expectedMigrationCount = @(Get-ChildItem -LiteralPath (Join-Path $projectRoot "db/migrations") -Filter "*.sql").Count
+    if ($LASTEXITCODE -ne 0 -or [int]$migrationCount.Trim() -ne $expectedMigrationCount) {
+        throw "Expected $expectedMigrationCount applied migrations, got '$($migrationCount.Trim())'"
     }
 
-    Write-Host "PASS: empty database migration, migration rerun, direct seed rerun, and foundation constraints."
+    Write-Host "PASS: empty database migration, migration rerun, all seed reruns, Phase 01-09 database regressions, and Phase 10 RLS/security tests."
 }
 finally {
     docker compose --project-directory $projectRoot exec -T postgres dropdb `

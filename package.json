@@ -1,0 +1,12 @@
+{
+  "name": "themis-lexiguard",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:ai": "node --test tests/ai/*.test.js",
+    "test:domain": "node --test tests/domain/*.test.js",
+    "test:monitoring": "node --test tests/monitoring/*.test.js",
+    "test:security": "node --test tests/security/*.test.js",
+    "test": "node --test tests/ai/*.test.js tests/domain/*.test.js tests/monitoring/*.test.js tests/security/*.test.js"
+  }
+}
